@@ -1,0 +1,109 @@
+
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >
+  Amazon RDS PostgreSQL database for the Coditude Notes application.
+  Uses private database subnets, Multi-AZ deployment, encryption,
+  automated backups, and AWS-managed master credentials.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - prod
+    Description: Deployment environment
+
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    Description: RDS database instance class
+
+Conditions:
+  IsProduction: !Equals
+    - !Ref EnvironmentName
+    - prod
+
+Resources:
+
+  # Private subnet group across two Availability Zones
+  DatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private subnets for PostgreSQL RDS
+      SubnetIds:
+        - Fn::ImportValue:
+            !Sub '${EnvironmentName}-DatabaseSubnetA'
+        - Fn::ImportValue:
+            !Sub '${EnvironmentName}-DatabaseSubnetB'
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-database-subnet-group'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # PostgreSQL RDS instance
+  NotesDatabase:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub '${EnvironmentName}-notes-database'
+      Engine: postgres
+      DBInstanceClass: !Ref DBInstanceClass
+      AllocatedStorage: 20
+      MaxAllocatedStorage: 100
+      StorageType: gp3
+      StorageEncrypted: true
+
+      DBName: notes_db
+      MasterUsername: notesadmin
+      ManageMasterUserPassword: true
+
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      VPCSecurityGroups:
+        - Fn::ImportValue:
+            !Sub '${EnvironmentName}-Database-SecurityGroup'
+
+      PubliclyAccessible: false
+      MultiAZ: !If
+        - IsProduction
+        - true
+        - false
+
+      BackupRetentionPeriod: 7
+      CopyTagsToSnapshot: true
+      AutoMinorVersionUpgrade: true
+      EnableCloudwatchLogsExports:
+        - postgresql
+
+      DeletionProtection: !If
+        - IsProduction
+        - true
+        - false
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-notes-database'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+Outputs:
+  DatabaseEndpoint:
+    Description: PostgreSQL database endpoint
+    Value: !GetAtt NotesDatabase.Endpoint.Address
+    Export:
+      Name: !Sub '${EnvironmentName}-DatabaseEndpoint'
+
+  DatabasePort:
+    Description: PostgreSQL database port
+    Value: !GetAtt NotesDatabase.Endpoint.Port
+    Export:
+      Name: !Sub '${EnvironmentName}-DatabasePort'
+
+  DatabaseSecretArn:
+    Description: ARN of the RDS-managed master credentials secret
+    Value: !GetAtt NotesDatabase.MasterUserSecret.SecretArn
+    Export:
+      Name: !Sub '${EnvironmentName}-DatabaseSecretArn'

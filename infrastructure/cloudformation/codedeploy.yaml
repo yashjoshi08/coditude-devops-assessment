@@ -1,0 +1,150 @@
+
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >
+  AWS CodeDeploy application, deployment group, service role,
+  and secure S3 bucket for application deployment revisions.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - prod
+    Description: Deployment environment
+
+Resources:
+
+  # S3 bucket for application deployment packages
+  DeploymentArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::AccountId}-${AWS::Region}-${EnvironmentName}-coditude-notes-artifacts'
+
+      VersioningConfiguration:
+        Status: Enabled
+
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldDeploymentArtifacts
+            Status: Enabled
+            ExpirationInDays: 90
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # CodeDeploy service role
+  CodeDeployServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-notes-codedeploy-service-role'
+
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codedeploy.amazonaws.com
+            Action:
+              - sts:AssumeRole
+
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSCodeDeployRole
+
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # Allow EC2 instances to download deployment revisions
+  EC2DeploymentArtifactsPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub '${EnvironmentName}-notes-deployment-artifacts-read'
+      Roles:
+        - !Sub '${EnvironmentName}-notes-ec2-role'
+
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:ListBucket
+            Resource: !GetAtt DeploymentArtifactsBucket.Arn
+
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+            Resource: !Sub '${DeploymentArtifactsBucket.Arn}/*'
+
+  # CodeDeploy application
+  NotesCodeDeployApplication:
+    Type: AWS::CodeDeploy::Application
+    Properties:
+      ApplicationName: !Sub '${EnvironmentName}-notes-application'
+      ComputePlatform: Server
+
+  # CodeDeploy deployment group
+  NotesDeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      ApplicationName: !Ref NotesCodeDeployApplication
+      DeploymentGroupName: !Sub '${EnvironmentName}-notes-deployment-group'
+      ServiceRoleArn: !GetAtt CodeDeployServiceRole.Arn
+
+      DeploymentConfigName: CodeDeployDefault.OneAtATime
+
+      DeploymentStyle:
+        DeploymentType: IN_PLACE
+        DeploymentOption: WITHOUT_TRAFFIC_CONTROL
+
+      AutoScalingGroups:
+        - Fn::ImportValue:
+            !Sub '${EnvironmentName}-ApplicationASGName'
+
+      AutoRollbackConfiguration:
+        Enabled: true
+        Events:
+          - DEPLOYMENT_FAILURE
+
+Outputs:
+
+  CodeDeployApplicationName:
+    Description: CodeDeploy application name
+    Value: !Ref NotesCodeDeployApplication
+    Export:
+      Name: !Sub '${EnvironmentName}-CodeDeployApplicationName'
+
+  CodeDeployDeploymentGroupName:
+    Description: CodeDeploy deployment group name
+    Value: !Ref NotesDeploymentGroup
+    Export:
+      Name: !Sub '${EnvironmentName}-CodeDeployDeploymentGroupName'
+
+  DeploymentArtifactsBucketName:
+    Description: S3 bucket for application deployment packages
+    Value: !Ref DeploymentArtifactsBucket
+    Export:
+      Name: !Sub '${EnvironmentName}-DeploymentArtifactsBucketName'
+
+  CodeDeployServiceRoleArn:
+    Description: CodeDeploy service role ARN
+    Value: !GetAtt CodeDeployServiceRole.Arn
+    Export:
+      Name: !Sub '${EnvironmentName}-CodeDeployServiceRoleArn'

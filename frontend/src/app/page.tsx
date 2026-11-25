@@ -9,7 +9,7 @@ interface Note {
 }
 
 const API_URL =
-  process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+  process.env.NEXT_PUBLIC_API_URL || "";
 
 export default function Home() {
   const [notes, setNotes] = useState<Note[]>([]);

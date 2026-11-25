@@ -1,0 +1,134 @@
+
+name: Deploy Notes Application
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'frontend/**'
+      - 'backend/**'
+      - 'deployment/codedeploy/**'
+      - 'deployment/scripts/**'
+      - '.github/workflows/deploy-application.yml'
+
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Deployment environment
+        required: true
+        type: choice
+        options:
+          - dev
+          - prod
+      deploy_to_aws:
+        description: Enable actual AWS deployment
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and Validate Application
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+
+      - name: Prepare CodeDeploy package
+        run: |
+          mkdir -p deploy-package/deployment
+          cp -r frontend backend deploy-package/
+
+          # Remove generated files and local environment configuration
+          rm -rf deploy-package/frontend/node_modules
+          rm -rf deploy-package/frontend/.next
+          rm -rf deploy-package/backend/venv
+          rm -rf deploy-package/backend/__pycache__
+          rm -f deploy-package/frontend/.env.local
+          rm -f deploy-package/backend/.env
+
+          # Add CodeDeploy configuration and scripts
+          cp -r deployment/scripts deploy-package/deployment/
+          cp deployment/codedeploy/appspec.yml deploy-package/appspec.yml
+
+      - name: Create deployment archive
+        run: |
+          cd deploy-package
+          zip -r ../notes-application.zip .
+
+      - name: Upload package as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: notes-application
+          path: notes-application.zip
+          retention-days: 7
+
+  deploy:
+    name: Deploy to AWS using CodeDeploy
+    needs: build
+    if: github.event_name == 'workflow_dispatch' && inputs.deploy_to_aws == true
+    runs-on: ubuntu-latest
+
+    environment: ${{ inputs.environment }}
+
+    steps:
+      - name: Download application package
+        uses: actions/download-artifact@v4
+        with:
+          name: notes-application
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Retrieve CodeDeploy infrastructure outputs
+        id: infrastructure
+        env:
+          DEPLOY_ENV: ${{ inputs.environment }}
+        run: |
+          STACK_NAME="${DEPLOY_ENV}-codedeploy"
+
+          OUTPUTS=$(aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --query "Stacks[0].Outputs" \
+            --output json)
+
+          echo "bucket=$(echo "$OUTPUTS" | jq -r '.[] | select(.OutputKey=="DeploymentArtifactsBucketName") | .OutputValue')" >> "$GITHUB_OUTPUT"
+
+          echo "application=$(echo "$OUTPUTS" | jq -r '.[] | select(.OutputKey=="CodeDeployApplicationName") | .OutputValue')" >> "$GITHUB_OUTPUT"
+
+          echo "deployment_group=$(echo "$OUTPUTS" | jq -r '.[] | select(.OutputKey=="CodeDeployDeploymentGroupName") | .OutputValue')" >> "$GITHUB_OUTPUT"
+
+      - name: Upload application revision to S3
+        run: |
+          aws s3 cp notes-application.zip \
+            "s3://${{ steps.infrastructure.outputs.bucket }}/notes-application-${{ github.sha }}.zip"
+
+      - name: Create CodeDeploy deployment
+        run: |
+          aws deploy create-deployment \
+            --application-name "${{ steps.infrastructure.outputs.application }}" \
+            --deployment-group-name "${{ steps.infrastructure.outputs.deployment_group }}" \
+            --s3-location "bucket=${{ steps.infrastructure.outputs.bucket }},key=notes-application-${{ github.sha }}.zip,bundleType=zip" \
+            --description "GitHub Actions deployment: ${{ github.sha }}"

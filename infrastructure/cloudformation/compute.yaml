@@ -1,0 +1,225 @@
+
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >
+  EC2 compute infrastructure for the Coditude Notes application.
+  Uses Amazon Linux 2023, an Auto Scaling Group across two private
+  subnets, IAM instance permissions, and ALB target groups.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - prod
+    Description: Deployment environment
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    Description: EC2 instance type
+
+  MinSize:
+    Type: Number
+    Default: 1
+    Description: Minimum number of EC2 instances
+
+  DesiredCapacity:
+    Type: Number
+    Default: 1
+    Description: Desired number of EC2 instances
+
+  MaxSize:
+    Type: Number
+    Default: 2
+    Description: Maximum number of EC2 instances
+
+Resources:
+
+  # IAM role for EC2 instances
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-notes-ec2-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+
+      Policies:
+        - PolicyName: ReadNotesDatabaseSecret
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  Fn::ImportValue:
+                    !Sub '${EnvironmentName}-DatabaseSecretArn'
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # Instance profile attached to EC2
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2InstanceRole
+
+  # EC2 Launch Template
+  ApplicationLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${EnvironmentName}-notes-launch-template'
+      LaunchTemplateData:
+        ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt EC2InstanceProfile.Arn
+
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            AssociatePublicIpAddress: false
+            Groups:
+              - Fn::ImportValue:
+                  !Sub '${EnvironmentName}-Application-SecurityGroup'
+
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required
+
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: 20
+              VolumeType: gp3
+              Encrypted: true
+              DeleteOnTermination: true
+        UserData:
+          Fn::Base64:
+            Fn::Sub:
+              - |
+                #!/bin/bash
+                set -euxo pipefail
+
+                dnf update -y
+
+                # Install application runtimes and deployment dependencies
+                dnf install -y nodejs npm python3.12 python3.12-pip ruby wget curl
+
+                # Create application configuration directory
+                install -d -o root -g ec2-user -m 0750 /etc/notes-app
+
+                # Configure database connection
+                cat > /etc/notes-app/notes.env <<EOF
+                DB_HOST=${DatabaseEndpoint}
+                DB_PORT=${DatabasePort}
+                DB_NAME=notes_db
+                DB_SECRET_ARN=${DatabaseSecretArn}
+                AWS_REGION=${AWS::Region}
+                EOF
+
+                chown root:ec2-user /etc/notes-app/notes.env
+                chmod 640 /etc/notes-app/notes.env
+
+                # Install AWS CodeDeploy agent
+                cd /tmp
+                wget https://aws-codedeploy-${AWS::Region}.s3.${AWS::Region}.amazonaws.com/latest/install
+                chmod +x ./install
+                ./install auto
+                systemctl enable codedeploy-agent
+                systemctl restart codedeploy-agent
+
+                # Install CloudWatch agent
+                wget https://amazoncloudwatch-agent-${AWS::Region}.s3.${AWS::Region}.amazonaws.com/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm
+                rpm -U ./amazon-cloudwatch-agent.rpm
+
+                systemctl enable amazon-cloudwatch-agent
+
+                echo "EC2 bootstrap completed successfully"
+
+              - DatabaseEndpoint:
+                  Fn::ImportValue:
+                    Fn::Sub: '${EnvironmentName}-DatabaseEndpoint'
+                DatabasePort:
+                  Fn::ImportValue:
+                    Fn::Sub: '${EnvironmentName}-DatabasePort'
+                DatabaseSecretArn:
+                  Fn::ImportValue:
+                    Fn::Sub: '${EnvironmentName}-DatabaseSecretArn'
+
+
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub '${EnvironmentName}-notes-app'
+              - Key: Environment
+                Value: !Ref EnvironmentName
+
+  # Auto Scaling Group across two private application subnets
+  ApplicationAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub '${EnvironmentName}-notes-asg'
+      MinSize: !Ref MinSize
+      DesiredCapacity: !Ref DesiredCapacity
+      MaxSize: !Ref MaxSize
+
+      VPCZoneIdentifier:
+        - Fn::ImportValue:
+            !Sub '${EnvironmentName}-AppSubnetA'
+        - Fn::ImportValue:
+            !Sub '${EnvironmentName}-AppSubnetB'
+
+      LaunchTemplate:
+        LaunchTemplateId: !Ref ApplicationLaunchTemplate
+        Version: !GetAtt ApplicationLaunchTemplate.LatestVersionNumber
+
+      TargetGroupARNs:
+        - Fn::ImportValue:
+            !Sub '${EnvironmentName}-FrontendTargetGroupArn'
+        - Fn::ImportValue:
+            !Sub '${EnvironmentName}-BackendTargetGroupArn'
+
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 600
+      DefaultInstanceWarmup: 300
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-notes-app'
+          PropagateAtLaunch: true
+        - Key: Environment
+          Value: !Ref EnvironmentName
+          PropagateAtLaunch: true
+
+Outputs:
+  AutoScalingGroupName:
+    Description: Name of the application Auto Scaling Group
+    Value: !Ref ApplicationAutoScalingGroup
+    Export:
+      Name: !Sub '${EnvironmentName}-ApplicationASGName'
+
+  LaunchTemplateId:
+    Description: EC2 Launch Template ID
+    Value: !Ref ApplicationLaunchTemplate
+    Export:
+      Name: !Sub '${EnvironmentName}-LaunchTemplateId'
+
+  EC2InstanceRoleArn:
+    Description: IAM role ARN attached to EC2 instances
+    Value: !GetAtt EC2InstanceRole.Arn
+    Export:
+      Name: !Sub '${EnvironmentName}-EC2InstanceRoleArn'
